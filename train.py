@@ -1,6 +1,7 @@
-import tensorflow as tf
+import torch
 import numpy as np
 import timeit
+import tensorflow as tf
 from tensorflow.python.platform import flags
 import torch.nn.functional as F
 from torch.nn.utils import clip_grad_norm
@@ -19,7 +20,6 @@ from torch.utils.data import DataLoader
 import time as time
 from io import StringIO
 from tensorflow.core.util import event_pb2
-import torch
 import numpy as np
 from scipy.misc import imsave
 import matplotlib.pyplot as plt
