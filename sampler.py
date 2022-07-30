@@ -35,18 +35,17 @@ def mcmc_step(y, log_tau, model):
   return new_y, log_tau_y
 
 
-def gen_ordinal(label, FLAGS, model, im_neg, num_steps, sample=False):
-  y = im_neg
-  log_tau = torch.tensor([0], device=y.device)
+def gen_ordinal(log_tau, FLAGS, model, im_neg, num_steps, sample=False):
+  y = im_neg  
   im_negs_samples = []
   for _ in range(num_steps):
     y, log_tau = mcmc_step(y, log_tau, model)
     if sample:
         im_negs_samples.append(y)
   if sample:
-    return y, im_negs_samples
+    return y, im_negs_samples, log_tau
   else:
-    return y
+    return y, log_tau
 
 
 if __name__ == '__main__':
@@ -64,4 +63,5 @@ if __name__ == '__main__':
   data_corrupt = torch.Tensor(np.random.uniform(0.0, 1.0, (128, 32, 32, 3)))
   data_corrupt = torch.Tensor(data_corrupt.float()).permute(0, 3, 1, 2).float().contiguous()
 
-  gen_ordinal(None, None, model, data_corrupt, 10, sample=True)
+  log_tau = torch.tensor([0], device=data_corrupt.device)
+  gen_ordinal(log_tau, None, model, data_corrupt, 10, sample=True)
