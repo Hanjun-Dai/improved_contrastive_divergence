@@ -6,7 +6,7 @@ import numpy as np
 
 def get_posterior(y, log_tau, model):  
   y.requires_grad_()
-  logp = -torch.sum(model.forward(y, None), dim=-1, keepdims=True)
+  logp = -torch.sum(model.forward(y, None), dim=-1, keepdims=True) * 10000
   grad_y = torch.autograd.grad(logp.sum(), y)[0].detach()
   delta = torch.arange(256, dtype=torch.float32).to(y.device) / 256.0 - torch.unsqueeze(y, -1)
   grad_y = torch.unsqueeze(grad_y, -1)
@@ -20,27 +20,29 @@ def mcmc_step(y, log_tau, model):
   dist_y = dists.Categorical(logits=log_posterior_y)
   v_cat = dist_y.sample()
   v = v_cat.float() / 256.0
-
   logp_next, log_posterior_v = get_posterior(v, log_tau, model)
-  dist_v = dists.Categorical(logits=log_posterior_v)
-  y_cat = (y * 256.0).to(torch.int64)
-  log_forward = torch.sum(dist_y.log_prob(v_cat), (1, 2, 3)) + logp_current.view(-1)
-  log_backward = torch.sum(dist_v.log_prob(y_cat), (1, 2, 3)) + logp_next.view(-1)
-  log_acc = log_backward - log_forward
-  accepted = (torch.rand_like(log_acc) < log_acc.exp()).float().view(-1, 1, 1, 1)
-  accs = torch.clamp(log_acc, max=0).exp().mean().item()
-  new_y = (1.0 - accepted) * y + accepted * v
-  log_tau_y = torch.clamp(log_tau.exp() + 1e-1 * (accs - 0.65) / 50, min=1e-10).log()
-  return new_y, log_tau_y
+  with torch.no_grad():
+    dist_v = dists.Categorical(logits=log_posterior_v)
+    y_cat = (y * 256.0).to(torch.int64)
+    log_forward = torch.sum(dist_y.log_prob(v_cat), (1, 2, 3)) + logp_current.view(-1)
+    log_backward = torch.sum(dist_v.log_prob(y_cat), (1, 2, 3)) + logp_next.view(-1)
+    log_acc = log_backward - log_forward
+    accepted = (torch.rand_like(log_acc) < log_acc.exp()).float().view(-1, 1, 1, 1)
+    accs = torch.clamp(log_acc, max=0).exp().mean().item()
+    new_y = (1.0 - accepted) * y + accepted * v
+    log_tau_y = torch.clamp(log_tau.exp() + 1e-1 * (accs - 0.65) / 50, min=1).log()
+  return new_y, log_tau_y, accs
 
 
 def gen_ordinal(log_tau, FLAGS, model, im_neg, num_steps, sample=False):
   y = im_neg  
   im_negs_samples = []
   for step in range(num_steps):
-    y, log_tau = mcmc_step(y, log_tau, model)
-    s = model.forward(y, None).mean()
+    s = model.forward(y, None).mean().detach()
     print(step, s.item())
+    y, log_tau, accs = mcmc_step(y, log_tau, model)
+    y = y.detach()
+    print(step, accs, log_tau.item())
     if sample:
         im_negs_samples.append(y)
   if sample:
