@@ -6,9 +6,9 @@ import numpy as np
 
 def get_posterior(y, log_tau, model):  
   y.requires_grad_()
-  logp = -model.forward(y)
+  logp = -torch.sum(model.forward(y, None), dim=-1, keepdims=True)
   grad_y = torch.autograd.grad(logp.sum(), y)[0].detach()
-  delta = torch.arange(256, dtype=torch.float32) / 256.0 - torch.unsqueeze(y, -1)
+  delta = torch.arange(256, dtype=torch.float32).to(y.device) / 256.0 - torch.unsqueeze(y, -1)
   grad_y = torch.unsqueeze(grad_y, -1)
   rate_y = delta * grad_y - delta ** 2 / torch.exp(log_tau) / 2
   log_posterior_y = rate_y / 2.0
@@ -24,22 +24,23 @@ def mcmc_step(y, log_tau, model):
   logp_next, log_posterior_v = get_posterior(v, log_tau, model)
   dist_v = dists.Categorical(logits=log_posterior_v)
   y_cat = (y * 256.0).to(torch.int64)
-
   log_forward = torch.sum(dist_y.log_prob(v_cat), (1, 2, 3)) + logp_current.view(-1)
   log_backward = torch.sum(dist_v.log_prob(y_cat), (1, 2, 3)) + logp_next.view(-1)
   log_acc = log_backward - log_forward
   accepted = (torch.rand_like(log_acc) < log_acc.exp()).float().view(-1, 1, 1, 1)
   accs = torch.clamp(log_acc, max=0).exp().mean().item()
   new_y = (1.0 - accepted) * y + accepted * v
-  log_tau_y = torch.clamp(log_tau.exp() + 1e-1 * (accs - 0.65) / 5000, min=1e-10).log()
+  log_tau_y = torch.clamp(log_tau.exp() + 1e-1 * (accs - 0.65) / 50, min=1e-10).log()
   return new_y, log_tau_y
 
 
 def gen_ordinal(log_tau, FLAGS, model, im_neg, num_steps, sample=False):
   y = im_neg  
   im_negs_samples = []
-  for _ in range(num_steps):
+  for step in range(num_steps):
     y, log_tau = mcmc_step(y, log_tau, model)
+    s = model.forward(y, None).mean()
+    print(step, s.item())
     if sample:
         im_negs_samples.append(y)
   if sample:
