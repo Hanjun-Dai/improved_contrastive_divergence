@@ -2,7 +2,9 @@ import torch
 import numpy as np
 import timeit
 import tensorflow as tf
-from tensorflow.python.platform import flags
+#from tensorflow.python.platform import flags
+from absl import flags
+from absl import app
 import torch.nn.functional as F
 from torch.nn.utils import clip_grad_norm
 import time
@@ -301,17 +303,21 @@ def gen_image(label, FLAGS, model, im_neg, num_steps, sample=False):
         im_neg = torch.clamp(im_neg, 0, 1)
 
     if sample:
-        return im_neg, im_neg_kl, im_negs_samples, im_grad
+        return im_neg, im_negs_samples, im_grad
     else:
-        return im_neg, im_neg_kl, im_grad
+        return im_neg, im_grad
 
 
-def test(models, models_ema, logger, dataloader, resume_iter, logdir, FLAGS, rank_idx, best_inception):
+def test(model, logger, dataloader):
+    pass
+
+def train(models, models_ema, optimizer, logger, dataloader, resume_iter, logdir, FLAGS, rank_idx, best_inception):
 
     torch.cuda.set_device(rank_idx)
 
     if FLAGS.replay_batch:
         if FLAGS.reservoir:
+            print(FLAGS.buffer_size, 'buffer')
             replay_buffer = ReservoirBuffer(FLAGS.buffer_size, FLAGS.transform, FLAGS.dataset)
         else:
             replay_buffer = ReplayBuffer(FLAGS.buffer_size, FLAGS.transform, FLAGS.dataset)
@@ -323,25 +329,26 @@ def test(models, models_ema, logger, dataloader, resume_iter, logdir, FLAGS, ran
     im_neg = None
     gd_steps = 1
 
+    optimizer.zero_grad()
+
     num_steps = FLAGS.num_steps
 
-    dev = torch.device("cuda:{}".format(rank_idx))
+    if FLAGS.cuda:
+        dev = torch.device("cuda:{}".format(rank_idx))
+    else:
+        dev = torch.device("cpu")
 
     for epoch in range(FLAGS.epoch_num):
         tock = time.time()
-        for data_corrupt, data, label in dataloader:
+        for _, data, label in dataloader:
             label = label.float().cuda(rank_idx)
             data = data.permute(0, 3, 1, 2).float().contiguous()
 
             # Generate samples to evaluate inception score
-            if itr % FLAGS.save_interval == 0:
-                if FLAGS.dataset == "cifar10":
-                    data_corrupt = torch.Tensor(np.random.uniform(0.0, 1.0, (128, 32, 32, 3)))
-                    repeat = 128 // FLAGS.batch_size + 1
-                    label = torch.cat([label] * repeat, axis=0)
-                    label = label[:128]
-                else:
-                    assert False
+            data_corrupt = torch.Tensor(np.random.uniform(0.0, 1.0, (128, 32, 32, 3)))
+            repeat = 128 // FLAGS.batch_size + 1
+            label = torch.cat([label] * repeat, axis=0)
+            label = label[:128]
 
             data_corrupt = torch.Tensor(data_corrupt.float()).permute(0, 3, 1, 2).float().contiguous()
             data = data.cuda(rank_idx)
@@ -354,7 +361,7 @@ def test(models, models_ema, logger, dataloader, resume_iter, logdir, FLAGS, ran
                     np.random.uniform(
                         0,
                         1,
-                        data_corrupt.size(0)) > 0.001)
+                        data_corrupt.size(0)) > 0)
                 data_corrupt[replay_mask] = torch.Tensor(replay_batch[replay_mask]).cuda(rank_idx)
             else:
                 idxs = None
@@ -362,10 +369,7 @@ def test(models, models_ema, logger, dataloader, resume_iter, logdir, FLAGS, ran
             ix = random.randint(0, len(models) - 1)
             model = models[ix]
 
-            if itr % FLAGS.save_interval == 0:
-                im_neg, im_neg_kl, im_samples, x_grad = gen_image(label, FLAGS, model, data_corrupt, num_steps, sample=True)
-            else:
-                im_neg, im_neg_kl, x_grad = gen_image(label, FLAGS, model, data_corrupt, num_steps)
+            im_neg, im_samples, x_grad = gen_image(label, FLAGS, model, data_corrupt, num_steps, sample=True)
 
             energy_pos = model.forward(data, label[:data.size(0)])
             energy_neg = model.forward(im_neg.clone(), label)
@@ -373,15 +377,27 @@ def test(models, models_ema, logger, dataloader, resume_iter, logdir, FLAGS, ran
             if FLAGS.replay_batch and (im_neg is not None):
                 replay_buffer.add(compress_x_mod(im_neg.detach().cpu().numpy()))
 
-            # ema_model(models, models_ema)
+            loss = energy_pos.mean() - energy_neg.mean() #
+            loss = loss  + (torch.pow(energy_pos, 2).mean() + torch.pow(energy_neg, 2).mean())
 
-            if torch.isnan(energy_pos.mean()):
-                assert False
+            loss_kl = torch.zeros(1)
+            loss_repel = torch.zeros(1)
 
-            if torch.abs(energy_pos.mean()) > 10.0:
-                assert False
+            hmc_loss = torch.zeros(1)
 
-            if itr % 10 == 0 and rank_idx == 0:
+            ml_grad = None
+            kl_grad = None
+
+            loss.backward()
+
+            [clip_grad_norm(model.parameters(), 0.5) for model in models]
+
+            optimizer.step()
+            optimizer.zero_grad()
+
+            ema_model(models, models_ema)
+
+            if itr % 1 == 0 and rank_idx == 0:
                 im_samples = im_samples[::10]
                 im_samples_total = torch.stack(im_samples, dim=1).detach().cpu().permute(0, 1, 3, 4, 2).numpy()
                 try_im = im_neg
@@ -424,14 +440,50 @@ def test(models, models_ema, logger, dataloader, resume_iter, logdir, FLAGS, ran
 
 
 def main_single(gpu, FLAGS):
+    if FLAGS.slurm:
+        init_distributed_mode(FLAGS)
+
+    os.environ['MASTER_ADDR'] = FLAGS.master_addr
+    os.environ['MASTER_PORT'] = FLAGS.port
+
     rank_idx = FLAGS.node_rank * FLAGS.gpus + gpu
     world_size = FLAGS.nodes * FLAGS.gpus
     print("Values of args: ", FLAGS)
+
+    if world_size > 1:
+        if FLAGS.slurm:
+            dist.init_process_group(backend='nccl', init_method='env://', world_size=world_size, rank=rank_idx)
+        else:
+            dist.init_process_group(backend='nccl', init_method='tcp://localhost:1700', world_size=world_size, rank=rank_idx)
 
     if FLAGS.dataset == "cifar10":
         train_dataset = Cifar10(FLAGS)
         valid_dataset = Cifar10(FLAGS, train=False, augment=False)
         test_dataset = Cifar10(FLAGS, train=False, augment=False)
+    elif FLAGS.dataset == "stl":
+        train_dataset = STLDataset(FLAGS)
+        valid_dataset = STLDataset(FLAGS, train=False)
+        test_dataset = STLDataset(FLAGS, train=False)
+    elif FLAGS.dataset == "object":
+        train_dataset = ObjectDataset(FLAGS.cond_idx)
+        valid_dataset = ObjectDataset(FLAGS.cond_idx)
+        test_dataset = ObjectDataset(FLAGS.cond_idx)
+    elif FLAGS.dataset == "imagenet":
+        train_dataset = ImageNet()
+        valid_dataset = ImageNet()
+        test_dataset = ImageNet()
+    elif FLAGS.dataset == "mnist":
+        train_dataset = Mnist(train=True)
+        valid_dataset = Mnist(train=False)
+        test_dataset = Mnist(train=False)
+    elif FLAGS.dataset == "celeba":
+        train_dataset = CelebAHQ(cond_idx=FLAGS.cond_idx)
+        valid_dataset = CelebAHQ(cond_idx=FLAGS.cond_idx)
+        test_dataset = CelebAHQ(cond_idx=FLAGS.cond_idx)
+    elif FLAGS.dataset == "lsun":
+        train_dataset = LSUNBed(cond_idx=FLAGS.cond_idx)
+        valid_dataset = LSUNBed(cond_idx=FLAGS.cond_idx)
+        test_dataset = LSUNBed(cond_idx=FLAGS.cond_idx)
     else:
         assert False
 
@@ -448,6 +500,7 @@ def main_single(gpu, FLAGS):
         model_path = osp.join(logdir, "model_{}.pth".format(FLAGS.resume_iter))
         checkpoint = torch.load(model_path)
         best_inception = checkpoint['best_inception']
+        print('loaded best inception:', best_inception)
         FLAGS = checkpoint['FLAGS']
 
         FLAGS.resume_iter = FLAGS_OLD.resume_iter
@@ -472,20 +525,37 @@ def main_single(gpu, FLAGS):
 
     if FLAGS.dataset == "cifar10":
         model_fn = ResNetModel
+    elif FLAGS.dataset == "stl":
+        model_fn = ResNetModel
+    elif FLAGS.dataset == "object":
+        model_fn = CelebAModel
+    elif FLAGS.dataset == "mnist":
+        model_fn = MNISTModel
+    elif FLAGS.dataset == "celeba":
+        model_fn = CelebAModel
+    elif FLAGS.dataset == "lsun":
+        model_fn = CelebAModel
+    elif FLAGS.dataset == "imagenet":
+        model_fn = ImagenetModel
     else:
         assert False
 
-    models = [model_fn(FLAGS).eval() for i in range(FLAGS.ensembles)]
-    models_ema = [model_fn(FLAGS).eval() for i in range(FLAGS.ensembles)]
+    models = [model_fn(FLAGS).train() for i in range(FLAGS.ensembles)]
+    models_ema = [model_fn(FLAGS).train() for i in range(FLAGS.ensembles)]
 
     torch.cuda.set_device(gpu)
     if FLAGS.cuda:
         models = [model.cuda(gpu) for model in models]
         model_ema = [model_ema.cuda(gpu) for model_ema in models_ema]
 
+    if FLAGS.gpus > 1:
+        sync_model(models)
+
     parameters = []
     for model in models:
         parameters.extend(list(model.parameters()))
+
+    optimizer = Adam(parameters, lr=FLAGS.lr, betas=(0.0, 0.9), eps=1e-8)
 
     ema_model(models, models_ema, mu=0.0)
 
@@ -500,26 +570,31 @@ def main_single(gpu, FLAGS):
     if FLAGS.resume_iter != 0:
         model_path = osp.join(logdir, "model_{}.pth".format(FLAGS.resume_iter))
         checkpoint = torch.load(model_path)
+        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+
         for i, (model, model_ema) in enumerate(zip(models, models_ema)):
             model.load_state_dict(checkpoint['model_state_dict_{}'.format(i)])
             model_ema.load_state_dict(checkpoint['ema_model_state_dict_{}'.format(i)])
+
 
     print("New Values of args: ", FLAGS)
 
     pytorch_total_params = sum([p.numel() for p in model.parameters() if p.requires_grad])
     print("Number of parameters for models", pytorch_total_params)
 
-    test(models, models_ema, logger, train_dataloader, FLAGS.resume_iter, logdir, FLAGS, gpu, best_inception)
+    train(models, models_ema, optimizer, logger, train_dataloader, FLAGS.resume_iter, logdir, FLAGS, gpu, best_inception)
 
-
-def main():
+def main(argv):
     flags_dict = EasyDict()
 
     for key in dir(FLAGS):
         flags_dict[key] = getattr(FLAGS, key)
 
-    main_single(0, flags_dict)
+    if FLAGS.gpus > 1:
+        mp.spawn(main_single, nprocs=FLAGS.gpus, args=(flags_dict,))
+    else:
+        main_single(0, flags_dict)
 
 
 if __name__ == "__main__":
-    main()
+    app.run(main)

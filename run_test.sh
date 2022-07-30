@@ -2,7 +2,7 @@
 
 export CUDA_VISIBLE_DEVICES=4
 
-python train.py \
+python test.py \
 	--exp=cifar10_model_bak \
 	--step_lr=100.0 \
 	--num_steps=40 \
@@ -12,5 +12,4 @@ python train.py \
 	--kl=True \
 	--multiscale \
 	--self_attn \
-  --resume_iter=7000 \
-  --lr=0.0
+	--resume_iter=16000 \
