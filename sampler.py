@@ -159,6 +159,88 @@ def gen_gwg(log_tau, FLAGS, model, im_neg, num_steps, sample=False):
   else:
     return y, log_tau
 
+def log1mexp(x):
+    # Computes log(1-exp(-|x|))
+    # See https://cran.r-project.org/web/packages/Rmpfr/vignettes/log1mexp-note.pdf
+    x = -x.abs()
+    return torch.where(x > -0.693, torch.log(-torch.expm1(x)), torch.log1p(-torch.exp(x)))
+
+
+def pafs_step(x, model):
+    bsize = x.shape[0]
+    b_idx = torch.arange(bsize).unsqueeze(-1)
+    x_rank = len(x.shape) - 1
+    R = 1000
+
+    x.requires_grad_()
+    score_x = model(x)
+    grad_x = torch.autograd.grad(score_x.sum(), x)[0].detach()
+    with torch.no_grad():
+        score_change_x = (grad_x - (grad_x * x).sum(dim=-1, keepdim=True)) / 2.0
+        score_change_x[x>0] = -float("inf")
+        log_prob_x_site = torch.logsumexp(score_change_x, dim=2) - \
+                      torch.logsumexp(score_change_x, dim=[1, 2]).unsqueeze(-1)
+        index = torch.multinomial(log_prob_x_site.exp(), R)
+        log_prob_x_value = score_change_x[b_idx, index]
+        dist_x = dists.Multinomial(logits=log_prob_x_value)
+        y_value = dist_x.sample()
+        y = x.clone()
+        y[b_idx, index] = y_value
+
+    y.requires_grad_()
+    score_y = model(y)
+    grad_y = torch.autograd.grad(score_y.sum(), y)[0].detach()
+    with torch.no_grad():
+        score_change_y = (grad_y - (grad_y * y).sum(dim=-1, keepdim=True)) / 2.0
+        score_change_y[y > 0] = -float("inf")
+        log_prob_y_site = torch.logsumexp(score_change_y, dim=2) - \
+                          torch.logsumexp(score_change_y, dim=[1, 2]).unsqueeze(-1)
+        log_prob_y_value = score_change_y[b_idx, index]
+        dist_y = dists.Multinomial(logits=log_prob_y_value)
+        x_value = x[b_idx, index]
+        tri_u = torch.triu(torch.ones(R, R, device=x.device), 1)
+        log_x_selected = log_prob_x_site[b_idx, index]
+        log_x_max = torch.max(log_x_selected, dim=-1, keepdim=True).values
+        log_x_u = log_x_max + torch.log(torch.exp(log_x_selected - log_x_max) @ tri_u)
+        log_x = (log_x_selected - log1mexp(log_x_u)).sum(dim=-1)
+        # log_x = (log_x_selected - torch.log1p(-torch.exp(log_x_u))).sum(dim=-1)
+
+        tri_l = torch.tril(torch.ones(R, R, device=x.device), -1)
+        log_y_selected = log_prob_y_site[b_idx, index]
+        log_y_max = torch.max(log_y_selected, dim=-1, keepdim=True).values
+        log_y_l = log_y_max + torch.log(torch.exp(log_y_selected - log_y_max) @ tri_l)
+        log_y = (log_y_selected - log1mexp(log_y_l)).sum(dim=-1)
+        # log_y = (log_y_selected - torch.log1p(-torch.exp(log_y_l))).sum(dim=-1)
+
+        log_acc = score_y + log_y + dist_y.log_prob(x_value).sum(-1) - \
+                  score_x - log_x - dist_x.log_prob(y_value).sum(-1)
+        accepted = (log_acc.exp() >= torch.rand_like(log_acc)).float().view(-1, *([1] * x_rank))
+        new_x = y * accepted + (1.0 - accepted) * x
+
+    accs = torch.clamp(log_acc.exp(), max=1).mean().item()
+    return new_x, accs
+
+
+def gen_pafs(log_tau, FLAGS, model, im_neg, num_steps, sample=False):
+  val = torch.arange(256, dtype=torch.float32).to(im_neg.device) / 256.0
+  model_fn = lambda x: -torch.sum(model.forward(torch.sum(x * val, dim=-1).view(im_neg.shape), None), dim=-1) * 10000
+  y_cat = (torch.clamp(im_neg, max=0.999) * 256.0).to(torch.int64)
+  y = F.one_hot(y_cat, num_classes=256).view(im_neg.shape[0], -1, 256).float()
+
+  im_negs_samples = []
+  val = torch.arange(256, dtype=torch.float32).to(y.device) / 256.0
+  for step in range(num_steps):
+    s = model.forward(torch.sum(y * val, dim=-1).view(im_neg.shape), None).mean().detach()
+    print(s.item())
+    y, accs = pafs_step(y, model_fn)
+    y = y.detach()
+    if sample:
+        im_negs_samples.append(y) 
+  if sample:
+    return y, im_negs_samples, log_tau
+  else:
+    return y, log_tau
+
 
 if __name__ == '__main__':
   torch.manual_seed(1)
@@ -179,5 +261,5 @@ if __name__ == '__main__':
 
   log_tau = torch.tensor([0], device=data_corrupt.device)
   # gen_ordinal(log_tau, None, model, data_corrupt, 10, sample=True)
-  gen_gwg(log_tau, None, model, data_corrupt, 10, sample=True)
+  gen_pafs(log_tau, None, model, data_corrupt, 10, sample=True)
   # gen_categorical(log_tau, None, model, data_corrupt, 10, sample=True)
