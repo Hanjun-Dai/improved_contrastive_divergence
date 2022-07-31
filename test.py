@@ -1,8 +1,6 @@
 import torch
 import numpy as np
 import timeit
-import tensorflow as tf
-#from tensorflow.python.platform import flags
 from absl import flags
 from absl import app
 import torch.nn.functional as F
@@ -14,14 +12,12 @@ from data import Cifar10, CelebAHQ, Mnist, ImageNet, LSUNBed, STLDataset
 from models import ResNetModel, CelebAModel, MNISTModel, ImagenetModel
 import os.path as osp
 import os
-from logger import TensorBoardOutputFormat
 from utils import ReplayBuffer, ReservoirBuffer
 from tqdm import tqdm
 import random
 from torch.utils.data import DataLoader
 import time as time
 from io import StringIO
-from tensorflow.core.util import event_pb2
 import numpy as np
 from scipy.misc import imsave
 import matplotlib.pyplot as plt
@@ -122,28 +118,6 @@ def decompress_x_mod(x_mod):
     return x_mod
 
 
-def make_image(tensor):
-    """Convert an numpy representation image to Image protobuf"""
-    from PIL import Image
-    if len(tensor.shape) == 4:
-        _, height, width, channel = tensor.shape
-    elif len(tensor.shape) == 3:
-        height, width, channel = tensor.shape
-    elif len(tensor.shape) == 2:
-        height, width = tensor.shape
-        channel = 1
-    tensor = tensor.astype(np.uint8).squeeze()
-    image = Image.fromarray(tensor)
-    import io
-    output = io.BytesIO()
-    image.save(output, format='png')
-    image_string = output.getvalue()
-    output.close()
-    return tf.Summary.Image(height=height,
-                            width=width,
-                            colorspace=channel,
-                            encoded_image_string=image_string)
-
 def sync_model(models):
     size = float(dist.get_world_size())
 
@@ -169,78 +143,11 @@ def average_gradients(models):
             dist.all_reduce(param.grad.data, op=dist.reduce_op.SUM)
             param.grad.data /= size
 
-
-
-def log_image(im, logger, tag, step=0):
-    im = make_image(im)
-
-    summary = [tf.Summary.Value(tag=tag, image=im)]
-    summary = tf.Summary(value=summary)
-    event = event_pb2.Event(summary=summary)
-    event.step = step
-    logger.writer.WriteEvent(event)
-    logger.writer.Flush()
-
 def rescale_im(image):
     image = np.clip(image, 0, 1)
     return (np.clip(image * 256, 0, 255)).astype(np.uint8)
 
-
-def hamiltonian(x, v, model, label):
-    energy = 0.5 * torch.pow(v, 2).sum(dim=1).sum(dim=1).sum(dim=1) + model.forward(x, label).squeeze()
-    return energy
-
-
-def leapfrog_step(x, v, model, step_size, num_steps, label, sample=False):
-    x.requires_grad_(requires_grad=True)
-    energy = model.forward(x, label)
-    im_grad = torch.autograd.grad([energy.sum()], [x])[0]
-    v = v - 0.5 * step_size * im_grad
-    im_negs = []
-
-    for i in range(num_steps):
-        x.requires_grad_(requires_grad=True)
-        energy = model.forward(x, label)
-
-        if i == num_steps - 1:
-            im_grad = torch.autograd.grad([energy.sum()], [x], create_graph=True)[0]
-            v = v - step_size * im_grad
-            x = x + step_size * v
-            v = v.detach()
-        else:
-            im_grad = torch.autograd.grad([energy.sum()], [x])[0]
-            v = v - step_size * im_grad
-            x = x + step_size * v
-            x = x.detach()
-            v = v.detach()
-
-
-        if sample:
-            im_negs.append(x)
-
-        if i % 10 == 0:
-            print(i, hamiltonian(torch.sigmoid(x), v, model, label).mean(), torch.abs(im_grad).mean())
-
-    if sample:
-        return x, im_negs, v, im_grad
-    else:
-        return x, v, im_grad
-
-
-def gen_hmc_image(label, FLAGS, model, im_neg, num_steps, sample=False):
-    step_size = FLAGS.step_lr
-
-    v = 0.001 * torch.randn_like(im_neg)
-
-    if sample:
-        im_neg, im_negs, v, im_grad = leapfrog_step(im_neg, v, model, step_size, num_steps, label, sample=sample)
-        return im_neg, im_negs, im_grad, v
-    else:
-        im_neg, v, im_grad = leapfrog_step(im_neg, v, model, step_size, num_steps, label, sample=sample)
-        return im_neg, im_grad, v
-
-
-def gen_image(label, FLAGS, model, im_neg, num_steps, sample=False):
+def gen_image(log_tau, FLAGS, model, im_neg, num_steps, sample=False):
     im_noise = torch.randn_like(im_neg).detach()
 
     im_negs_samples = []
@@ -251,7 +158,7 @@ def gen_image(label, FLAGS, model, im_neg, num_steps, sample=False):
         im_neg = im_neg + 0.001 * im_noise
 
         im_neg.requires_grad_(requires_grad=True)
-        energy = model.forward(im_neg, label)
+        energy = model.forward(im_neg, None)
 
         im_grad = torch.autograd.grad([energy.sum()], [im_neg])[0]
 
@@ -265,13 +172,27 @@ def gen_image(label, FLAGS, model, im_neg, num_steps, sample=False):
         im_neg = torch.clamp(im_neg, 0, 1)
 
     if sample:
-        return im_neg, im_negs_samples
+        return im_neg, im_negs_samples, log_tau
     else:
-        return im_neg
+        return im_neg, log_tau
 
 
 def test(model, logger, dataloader):
     pass
+
+from torchmetrics.image.inception import InceptionScore
+import functools
+def get_inception_pt(images, splits, inception):
+    images = torch.tensor(images, dtype=torch.uint8).permute(0, 3, 1, 2).contiguous()
+    inception.features = []
+    inception.update(images)
+    x, y = inception.compute()
+    return x.item(), y.item()
+
+
+def get_inception_tf(images, splits=1):
+    return score_tf(list(images), splits)
+
 
 def train(models, models_ema, optimizer, logger, dataloader, resume_iter, logdir, FLAGS, rank_idx, best_inception):
 
@@ -284,21 +205,31 @@ def train(models, models_ema, optimizer, logger, dataloader, resume_iter, logdir
         else:
             replay_buffer = ReplayBuffer(FLAGS.buffer_size, FLAGS.transform, FLAGS.dataset)
 
-    if rank_idx == 0:
-        from inception import get_inception_score
-
+    inception = InceptionScore(splits=1)
+    get_inception_score = functools.partial(get_inception_pt, inception=inception)
+    #from inception import get_inception_score as score_tf
+    #get_inception_score = get_inception_tf
     itr = resume_iter
     im_neg = None
     gd_steps = 1
 
     optimizer.zero_grad()
 
-    num_steps = FLAGS.num_steps
+    num_steps = 100
 
     if FLAGS.cuda:
         dev = torch.device("cuda:{}".format(rank_idx))
     else:
         dev = torch.device("cpu")
+
+    log_tau = torch.tensor([0.0], device=dev, dtype=torch.float32)
+    grad2 = torch.ones([3, 32, 32], device=dev)
+    grad = torch.ones([3, 32, 32], device=dev)
+    from sampler import gen_ordinal, gen_categorical
+    #gen_sample = gen_image
+    #gen_sample = gen_ordinal
+    #log_tau = (log_tau, grad2, grad)
+    gen_sample = gen_categorical
 
     for epoch in range(FLAGS.epoch_num):
         tock = time.time()
@@ -307,7 +238,7 @@ def train(models, models_ema, optimizer, logger, dataloader, resume_iter, logdir
             data = data.permute(0, 3, 1, 2).float().contiguous()
 
             # Generate samples to evaluate inception score
-            data_corrupt = torch.Tensor(np.random.uniform(0.0, 1.0, (128, 32, 32, 3)))
+            data_corrupt = torch.Tensor(np.random.uniform(0.0, 1.0, (256, 32, 32, 3)))
             repeat = 128 // FLAGS.batch_size + 1
             label = torch.cat([label] * repeat, axis=0)
             label = label[:128]
@@ -330,9 +261,11 @@ def train(models, models_ema, optimizer, logger, dataloader, resume_iter, logdir
 
             ix = random.randint(0, len(models) - 1)
             model = models[ix]
-
-            im_neg, im_samples = gen_image(label, FLAGS, model, data_corrupt, num_steps, sample=True)
-
+            e_before = model.forward(data_corrupt, None).detach()
+            im_neg, im_samples, log_tau = gen_sample(log_tau, FLAGS, model, data_corrupt, num_steps, sample=True)
+            e_after = model.forward(im_neg, None).detach()
+            print(torch.mean(e_before), torch.mean(e_after))
+            
             energy_pos = model.forward(data, label[:data.size(0)])
             energy_neg = model.forward(im_neg.clone(), label)
 
@@ -382,18 +315,14 @@ def train(models, models_ema, optimizer, logger, dataloader, resume_iter, logdir
 
                     new_im[:, -size:] = actual_im_i
 
-                    log_image(
-                        new_im, logger, 'train_gen_{}'.format(itr), step=i)
-
 
                 if rank_idx == 0:
-                    score, std = get_inception_score(list(try_im), splits=1)
+                    score, std = get_inception_score(try_im, splits=1)
                     print("Inception score of {} with std of {}".format(
                             score, std))
                     kvs = {}
                     kvs['inception_score'] = score
                     kvs['inception_score_std'] = std
-                    logger.writekvs(kvs)
 
                     if score > best_inception:
                         best_inception = score
@@ -521,7 +450,7 @@ def main_single(gpu, FLAGS):
 
     ema_model(models, models_ema, mu=0.0)
 
-    logger = TensorBoardOutputFormat(logdir)
+    logger = None #TensorBoardOutputFormat(logdir)
 
     it = FLAGS.resume_iter
 

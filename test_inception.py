@@ -1,13 +1,13 @@
-import tensorflow as tf
+import torch
 from PIL import Image
 import numpy as np
-from tensorflow.python.platform import flags
+from absl import flags
+from absl import app
 from models import ResNetModel, CelebAModel, MNISTModel
 from data import Mnist
 import os.path as osp
 import os
 from tqdm import tqdm
-import torch
 import random
 from scipy.misc import imsave
 from data import Cifar10, CelebAHQ
@@ -346,7 +346,7 @@ def compute_inception(model):
 
 
 
-def main():
+def main(argv):
 
     logdir = osp.join(FLAGS.logdir, FLAGS.exp)
     sandbox_logdir = osp.join('sandbox_cachedir', FLAGS.exp)
@@ -355,7 +355,9 @@ def main():
         os.makedirs(sandbox_logdir)
 
     model_path = osp.join(logdir, "model_{}.pth".format(FLAGS.resume_iter))
+    print('loading from', model_path)
     checkpoint = torch.load(model_path)
+    print('ckpt loaded')
     FLAGS_model = checkpoint['FLAGS']
 
     if FLAGS.dataset == "celeba":
@@ -364,16 +366,16 @@ def main():
         model = MNISTModel(FLAGS_model).eval().cuda()
     else:
         model = ResNetModel(FLAGS_model).eval().cuda()
-
+    
     if FLAGS.ema:
         model.load_state_dict(checkpoint['ema_model_state_dict_0'])
     else:
         model.load_state_dict(checkpoint['model_state_dict_0'])
-
+    print('model loaded')
     logdir = osp.join(FLAGS.logdir, FLAGS.exp)
     model = model.eval()
     compute_inception(model)
 
 
 if __name__ == "__main__":
-    main()
+    app.run(main)

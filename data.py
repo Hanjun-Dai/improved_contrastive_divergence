@@ -1,7 +1,5 @@
 print("start data import")
-from tensorflow.python.platform import flags
 from imageio import imread
-import tensorflow as tf
 import io
 import lmdb
 from PIL import Image
