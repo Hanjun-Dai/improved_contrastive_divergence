@@ -111,6 +111,55 @@ def gen_categorical(log_tau, FLAGS, model, im_neg, num_steps, sample=False):
     return y, log_tau
 
 
+def get_score_grad(z, model, val, raw_shape):
+  z.requires_grad_()
+  y = torch.sum(z * val, dim=-1)
+  y = y.view(raw_shape)
+  logp = -torch.sum(model.forward(y, None), dim=-1, keepdims=True) * 10000
+  grad_z = torch.autograd.grad(logp.sum(), z)[0].detach()
+  with torch.no_grad():
+    score_change_z = 0.5 * (grad_z - (grad_z * z).sum(dim=-1, keepdim=True))
+    score_change_z = score_change_z - 1e9 * z
+    dist = dists.Categorical(logits=score_change_z)
+  return logp, grad_z, dist
+
+
+def gwg_mcmc_step(y_init, model, val):
+  y_cat = (y_init * 256.0).to(torch.int64)
+  x = F.one_hot(y_cat, num_classes=256).view(y_init.shape[0], -1, 256).float()
+  score_x, _, dist_x = get_score_grad(x, model, val, y_cat.shape)
+
+  index_x = dist_x.sample()
+  log_x2y = torch.sum(dist_x.log_prob(index_x), dim=1, keepdims=True)
+
+  y = F.one_hot(index_x, num_classes=256).view(y_cat.shape[0], -1, 256).float()
+  score_y, _, dist_y = get_score_grad(y, model, val, y_cat.shape)
+
+  with torch.no_grad():
+    log_y2x = torch.sum(dist_y.log_prob(y_cat.view(y.shape[0], -1)), dim=1, keepdims=True)  
+    log_acc = score_y + log_y2x - score_x - log_x2y
+    accepted = (log_acc.exp() >= torch.rand_like(log_acc)).float().view(-1, 1, 1)
+    new_x = y * accepted + (1.0 - accepted) * x
+    accs = torch.clamp(log_acc.exp(), max=1).mean().item()
+    new_x = torch.argmax(new_x, axis=-1).view(y_init.shape).float() / 256.0
+  return new_x, accs
+
+
+def gen_gwg(log_tau, FLAGS, model, im_neg, num_steps, sample=False):
+  y = torch.clamp(im_neg, max=0.999)
+  im_negs_samples = []
+  val = torch.arange(256, dtype=torch.float32).to(y.device) / 256.0
+  for step in range(num_steps):
+    y, accs = gwg_mcmc_step(y, model, val)
+    y = y.detach()
+    if sample:
+        im_negs_samples.append(y)    
+  if sample:
+    return y, im_negs_samples, log_tau
+  else:
+    return y, log_tau
+
+
 if __name__ == '__main__':
   torch.manual_seed(1)
   np.random.seed(1)
@@ -130,4 +179,5 @@ if __name__ == '__main__':
 
   log_tau = torch.tensor([0], device=data_corrupt.device)
   # gen_ordinal(log_tau, None, model, data_corrupt, 10, sample=True)
-  gen_categorical(log_tau, None, model, data_corrupt, 10, sample=True)
+  gen_gwg(log_tau, None, model, data_corrupt, 10, sample=True)
+  # gen_categorical(log_tau, None, model, data_corrupt, 10, sample=True)
