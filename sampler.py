@@ -11,7 +11,7 @@ def get_posterior_o(y, log_tau, model, alpha):
   grad_y = torch.autograd.grad(logp.sum(), y)[0].detach()
   delta = torch.arange(256, dtype=torch.float32).to(y.device) / 256.0 - torch.unsqueeze(y, -1)
   grad_y = torch.unsqueeze(grad_y, -1)
-  alpha = alpha.unsqueeze(-1).unsqueeze(0)
+  alpha = alpha.unsqueeze(-1).unsqueeze(0) * 0 + 1.0
   rate_y = delta * grad_y - alpha * delta ** 2 / torch.exp(log_tau) / 2
   log_posterior_y = rate_y / 2.0
   return logp, log_posterior_y, grad_y.squeeze(-1)
@@ -29,11 +29,12 @@ def o_mcmc_step(y, log_tau, model):
     y_cat = (y * 256.0).to(torch.int64)
     log_forward = torch.sum(dist_y.log_prob(v_cat), (1, 2, 3)) + logp_current.view(-1)
     log_backward = torch.sum(dist_v.log_prob(y_cat), (1, 2, 3)) + logp_next.view(-1)
-    log_acc = log_backward - log_forward
+    #log_acc = log_backward - log_forward
+    log_acc = logp_next.view(-1) - logp_current.view(-1)
     accepted = (torch.rand_like(log_acc) < log_acc.exp()).float().view(-1, 1, 1, 1)
     accs = torch.clamp(log_acc, max=0).exp().mean().item()
     new_y = (1.0 - accepted) * y + accepted * v
-    log_tau_y = torch.clamp(log_tau.exp() + 1e-1 * (accs - 0.65) / 50, min=1).log()
+    log_tau_y = torch.clamp(log_tau.exp() + 1e-1 * (accs - 0.65) / 50, min=1e-10).log()
     grad2 = 0.9 * grad2 + 0.1 * (grad_v - grad_y).abs().mean(0)
     grad = 0.9 * grad + 0.1 * torch.clamp((v - y).abs().mean(), min=1.0 / 256.0)
   return new_y, (log_tau_y, grad2, grad), accs
@@ -58,7 +59,7 @@ def get_posterior_f(z, log_tau, model, val, raw_shape):
   z.requires_grad_()
   y = torch.sum(z * val, dim=-1)
   y = y.view(raw_shape)
-  logp = -torch.sum(model.forward(y, None), dim=-1, keepdims=True) * 100000
+  logp = -torch.sum(model.forward(y, None), dim=-1, keepdims=True) * 500000
   grad_z = torch.autograd.grad(logp.sum(), z)[0].detach()
   
   with torch.no_grad():
@@ -81,7 +82,8 @@ def c_mcmc_step(y, log_tau, model, val):
   logp_next, log_posterior_w = get_posterior_f(w, log_tau, model, val, y_cat.shape)
   with torch.no_grad():
     dist_next = dists.Multinomial(logits=log_posterior_w)
-    log_acc = logp_next.view(-1) + dist_next.log_prob(z).sum(-1) - logp_current.view(-1) - dist_current.log_prob(w).sum(-1)
+    #log_acc = logp_next.view(-1) + dist_next.log_prob(z).sum(-1) - logp_current.view(-1) - dist_current.log_prob(w).sum(-1)
+    log_acc = logp_next.view(-1) - logp_current.view(-1) 
     accepted = (log_acc.exp() >= torch.rand_like(log_acc)).to(z.dtype).view(-1, *([1] * z_rank))
     new_z = w * accepted + (1.0 - accepted) * z
     accs = torch.clamp(log_acc, max=0).exp().mean().item()
